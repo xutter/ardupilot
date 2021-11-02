@@ -40,7 +40,7 @@ public:
     }
 
 protected:
-    const float hover_throttle = 0.7f;
+    const float hover_throttle = 0.1f;
     const float air_density = 1.225; // kg/m^3 at sea level, ISA conditions
     float angle_of_attack;
     float beta;
