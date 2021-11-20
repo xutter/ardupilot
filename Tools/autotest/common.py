@@ -24,6 +24,7 @@ import numpy
 import socket
 import struct
 import random
+import tempfile
 import threading
 import enum
 
@@ -319,6 +320,170 @@ class Telem(object):
         self.update_read()
 
 
+class MSP_Generic(Telem):
+    def __init__(self, destination_address):
+        super(MSP_Generic, self).__init__(destination_address)
+
+        self.callback = None
+
+        self.STATE_IDLE = "IDLE"
+        self.STATE_WANT_HEADER_DOLLARS = "WANT_DOLLARS"
+        self.STATE_WANT_HEADER_M = "WANT_M"
+        self.STATE_WANT_HEADER_GT = "WANT_GT"
+        self.STATE_WANT_DATA_SIZE = "WANT_DATA_SIZE"
+        self.STATE_WANT_COMMAND = "WANT_COMMAND"
+        self.STATE_WANT_DATA = "WANT_DATA"
+        self.STATE_WANT_CHECKSUM = "WANT_CHECKSUM"
+
+        self.state = self.STATE_IDLE
+
+    def progress(self, message):
+        print("MSP: %s" % message)
+
+    def set_state(self, state):
+        # self.progress("Moving to state (%s)" % state)
+        self.state = state
+
+    def init_checksum(self, b):
+        self.checksum = 0
+        self.add_to_checksum(b)
+
+    def add_to_checksum(self, b):
+        self.checksum ^= (b & 0xFF)
+
+    def process_command(self, cmd, data):
+        if self.callback is not None:
+            self.callback(cmd, data)
+        else:
+            print("cmd=%s" % str(cmd))
+
+    def update_read(self):
+        for byte in self.do_read():
+            if sys.version_info[0] < 3:
+                c = byte[0]
+                byte = ord(c)
+            else:
+                c = chr(byte)
+            # print("Got (0x%02x) (%s) (%s) state=%s" % (byte, chr(byte), str(type(byte)), self.state))
+            if self.state == self.STATE_IDLE:
+                # reset state
+                self.set_state(self.STATE_WANT_HEADER_DOLLARS)
+                # deliberate fallthrough right here
+            if self.state == self.STATE_WANT_HEADER_DOLLARS:
+                if c == '$':
+                    self.set_state(self.STATE_WANT_HEADER_M)
+                continue
+            if self.state == self.STATE_WANT_HEADER_M:
+                if c != 'M':
+                    raise Exception("Malformed packet")
+                self.set_state(self.STATE_WANT_HEADER_GT)
+                continue
+            if self.state == self.STATE_WANT_HEADER_GT:
+                if c != '>':
+                    raise Exception("Malformed packet")
+                self.set_state(self.STATE_WANT_DATA_SIZE)
+                continue
+            if self.state == self.STATE_WANT_DATA_SIZE:
+                self.data_size = byte
+                self.set_state(self.STATE_WANT_COMMAND)
+                self.data = bytearray()
+                self.checksum = 0
+                self.add_to_checksum(byte)
+                continue
+            if self.state == self.STATE_WANT_COMMAND:
+                self.command = byte
+                self.add_to_checksum(byte)
+                if self.data_size != 0:
+                    self.set_state(self.STATE_WANT_DATA)
+                else:
+                    self.set_state(self.STATE_WANT_CHECKSUM)
+                continue
+            if self.state == self.STATE_WANT_DATA:
+                self.add_to_checksum(byte)
+                self.data.append(byte)
+                if len(self.data) == self.data_size:
+                    self.set_state(self.STATE_WANT_CHECKSUM)
+                continue
+            if self.state == self.STATE_WANT_CHECKSUM:
+                if self.checksum != byte:
+                    raise Exception("Checksum fail (want=0x%02x calced=0x%02x" %
+                                    (byte, self.checksum))
+                self.process_command(self.command, self.data)
+                self.set_state(self.STATE_IDLE)
+
+
+class MSP_DJI(MSP_Generic):
+    FRAME_GPS_RAW  = 106
+    FRAME_ATTITUDE = 108
+
+    def __init__(self, destination_address):
+        super(MSP_DJI, self).__init__(destination_address)
+        self.callback = self.command_callback
+        self.frames = {}
+
+    class Frame(object):
+        def __init__(self, data):
+            self.data = data
+
+        def intn(self, offset, count):
+            ret = 0
+            for i in range(offset, offset+count):
+                ret = ret | (ord(self.data[i]) << ((i-offset)*8))
+            return ret
+
+        def int32(self, offset):
+            t = struct.unpack("<i", self.data[offset:offset+4])
+            return t[0]
+
+        def int16(self, offset):
+            t = struct.unpack("<h", self.data[offset:offset+2])
+            return t[0]
+
+    class FrameATTITUDE(Frame):
+        def roll(self):
+            '''roll in degrees'''
+            return self.int16(0) * 10
+
+        def pitch(self):
+            '''pitch in degrees'''
+            return self.int16(2) * 10
+
+        def yaw(self):
+            '''yaw in degrees'''
+            return self.int16(4)
+
+    class FrameGPS_RAW(Frame):
+        '''see gps_state_s'''
+        def fix_type(self):
+            return self.uint8(0)
+
+        def num_sats(self):
+            return self.uint8(1)
+
+        def lat(self):
+            return self.int32(2) / 1e7
+
+        def lon(self):
+            return self.int32(6) / 1e7
+
+        def LocationInt(self):
+            # other fields are available, I'm just lazy
+            return LocationInt(self.int32(2), self.int32(6), 0, 0)
+
+    def command_callback(self, frametype, data):
+        # print("X: %s %s" % (str(frametype), str(data)))
+        if frametype == MSP_DJI.FRAME_ATTITUDE:
+            frame = MSP_DJI.FrameATTITUDE(data)
+        elif frametype == MSP_DJI.FRAME_GPS_RAW:
+            frame = MSP_DJI.FrameGPS_RAW(data)
+        else:
+            return
+        self.frames[frametype] = frame
+
+    def get_frame(self, frametype):
+        return self.frames[frametype]
+
+
 class LTM(Telem):
     def __init__(self, destination_address):
         super(LTM, self).__init__(destination_address)
@@ -518,6 +683,82 @@ class CRSF(Telem):
 
     def progress_tag(self):
         return "CRSF"
+
+
+class DEVO(Telem):
+    def __init__(self, destination_address):
+        super(DEVO, self).__init__(destination_address)
+
+        self.HEADER = 0xAA
+        self.frame_length = 20
+        self.frame = None
+        self.bad_chars = 0
+
+    def progress_tag(self):
+        return "DEVO"
+
+    def consume_frame(self):
+        # check frame checksum
+        checksum = 0
+        for c in self.buffer[:self.frame_length-1]:
+            if sys.version_info.major < 3:
+                c = ord(c)
+            checksum += c
+        checksum &= 0xff    # since we receive 8 bit checksum
+        buffer_checksum = self.buffer[self.frame_length-1]
+        if sys.version_info.major < 3:
+            buffer_checksum = ord(buffer_checksum)
+        if checksum != buffer_checksum:
+            raise NotAchievedException("Invalid checksum")
+
+        class FRAME(object):
+            def __init__(self, buffer):
+                self.buffer = buffer
+
+            def int32(self, offset):
+                t = struct.unpack("<i", self.buffer[offset:offset+4])
+                return t[0]
+
+            def int16(self, offset):
+                t = struct.unpack("<h", self.buffer[offset:offset+2])
+                return t[0]
+
+            def lon(self):
+                return self.int32(1)
+
+            def lat(self):
+                return self.int32(5)
+
+            def alt(self):
+                return self.int32(9)
+
+            def speed(self):
+                return self.int16(13)
+
+            def temp(self):
+                return self.int16(15)
+
+            def volt(self):
+                return self.int16(17)
+
+        self.frame = FRAME(self.buffer[0:self.frame_length-1])
+        self.buffer = self.buffer[self.frame_length:]
+
+    def update_read(self):
+        self.buffer += self.do_read()
+        while len(self.buffer):
+            if len(self.buffer) == 0:
+                break
+            b0 = self.buffer[0]
+            if sys.version_info.major < 3:
+                b0 = ord(b0)
+            if b0 != self.HEADER:
+                self.bad_chars += 1
+                self.buffer = self.buffer[1:]
+                continue
+            if len(self.buffer) < self.frame_length:
+                continue
+            self.consume_frame()
 
 
 class FRSky(Telem):
@@ -1286,6 +1527,9 @@ class AutoTest(ABC):
 
         self.start_mavproxy_count = 0
 
+        self.last_sim_time_cached = 0
+        self.last_sim_time_cached_wallclock = 0
+
     def __del__(self):
         if self.rc_thread is not None:
             self.progress("Joining RC thread in __del__")
@@ -1592,7 +1836,7 @@ class AutoTest(ABC):
         while True:
             if time.time() - tstart > 30:
                 raise NotAchievedException("STAT_RESET did not go non-zero")
-            if self.get_parameter('STAT_RESET') != 0:
+            if self.get_parameter('STAT_RESET', timeout_in_wallclock=True) != 0:
                 break
 
         old_bootcount = self.get_parameter('STAT_BOOTCNT')
@@ -2401,6 +2645,7 @@ class AutoTest(ABC):
         while mav.recv_match(blocking=False) is not None:
             count += 1
         if quiet:
+            self.in_drain_mav = False
             return
         tdelta = time.time() - tstart
         if tdelta == 0:
@@ -2758,17 +3003,31 @@ class AutoTest(ABC):
     def get_sim_time(self, timeout=60):
         """Get SITL time in seconds."""
         self.drain_mav()
-        m = self.mav.recv_match(type='SYSTEM_TIME', blocking=True, timeout=timeout)
-        if m is None:
-            raise AutoTestTimeoutException("Did not get SYSTEM_TIME message after %f seconds" % timeout)
-        return m.time_boot_ms * 1.0e-3
+        tstart = time.time()
+        while True:
+            self.drain_all_pexpects()
+            if time.time() - tstart > timeout:
+                raise AutoTestTimeoutException("Did not get SYSTEM_TIME message after %f seconds" % timeout)
+
+            m = self.mav.recv_match(type='SYSTEM_TIME', blocking=True, timeout=0.1)
+            if m is None:
+                continue
+
+            return m.time_boot_ms * 1.0e-3
 
     def get_sim_time_cached(self):
         """Get SITL time in seconds."""
         x = self.mav.messages.get("SYSTEM_TIME", None)
         if x is None:
             raise NotAchievedException("No cached time available (%s)" % (self.mav.sysid,))
-        return x.time_boot_ms * 1.0e-3
+        ret = x.time_boot_ms * 1.0e-3
+        if ret != self.last_sim_time_cached:
+            self.last_sim_time_cached = ret
+            self.last_sim_time_cached_wallclock = time.time()
+        else:
+            if time.time() - self.last_sim_time_cached_wallclock > 30:
+                raise AutoTestTimeoutException("sim_time_cached is not updating!")
+        return ret
 
     def sim_location(self):
         """Return current simulator location."""
@@ -5983,6 +6242,9 @@ Also, ignores heartbeats not from our target system'''
             text = text.encode('ascii')
         self.mav.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_WARNING, text)
 
+    def get_stacktrace(self):
+        return ''.join(traceback.format_stack())
+
     def get_exception_stacktrace(self, e):
         if sys.version_info[0] >= 3:
             ret = "%s\n" % e
@@ -6047,6 +6309,11 @@ Also, ignores heartbeats not from our target system'''
             pass
         self.progress("Most recent logfile: %s" % (path, ), send_statustext=send_statustext)
 
+    def progress_file_content(self, filepath):
+        with open(filepath) as f:
+            for line in f:
+                self.progress(line.rstrip())
+
     def run_one_test_attempt(self, test, interact=False, attempt=1, do_fail_list=True):
         '''called by run_one_test to actually run the test in a retry loop'''
         name = test.name
@@ -6102,7 +6369,7 @@ Also, ignores heartbeats not from our target system'''
             ardupilot_alive = True
         except Exception:
             # process is dead
-            self.progress("Not alive after test", send_statustext=False)
+            self.progress("No heartbeat after test", send_statustext=False)
             if self.sitl.isalive():
                 self.progress("pexpect says it is alive")
                 for tool in "dumpstack.sh", "dumpcore.sh":
@@ -6112,6 +6379,15 @@ Also, ignores heartbeats not from our target system'''
                         return False
             else:
                 self.progress("pexpect says it is dead")
+
+            # try dumping the process status file for more information:
+            status_filepath = "/proc/%u/status" % self.sitl.pid
+            self.progress("Checking for status filepath (%s)" % status_filepath)
+            if os.path.exists(status_filepath):
+                self.progress_file_content(status_filepath)
+            else:
+                self.progress("... does not exist")
+
             passed = False
             reset_needed = True
 
@@ -10736,6 +11012,108 @@ switch value'''
                     self.progress("  Fulfilled")
                     del wants[want]
 
+    def convertDmsToDdFormat(self, dms):
+        deg = math.trunc(dms * 1e-7)
+        dd = deg + (((dms * 1.0e-7) - deg) * 100.0 / 60.0)
+        if dd < -180.0 or dd > 180.0:
+            dd = 0.0
+        return math.trunc(dd * 1.0e7)
+
+    def DEVO(self):
+        self.context_push()
+        self.set_parameter("SERIAL5_PROTOCOL", 17) # serial5 is DEVO output
+        self.customise_SITL_commandline([
+            "--uartF=tcp:6735" # serial5 spews to localhost:6735
+        ])
+        devo = DEVO(("127.0.0.1", 6735))
+        self.wait_ready_to_arm()
+        self.drain_mav_unparsed()
+        m = self.mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
+        if m is None:
+            raise NotAchievedException("Did not receive GLOBAL_POSITION_INT")
+
+        tstart = self.get_sim_time_cached()
+        while True:
+            now = self.get_sim_time_cached()
+            if now - tstart > 10:
+                raise AutoTestTimeoutException("Failed to get devo data")
+
+            devo.update()
+            frame = devo.frame
+            if frame is None:
+                self.progress("No data received")
+                continue
+
+            m = self.mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+
+            loc = LocationInt(self.convertDmsToDdFormat(frame.lat()), self.convertDmsToDdFormat(frame.lon()), 0, 0)
+
+            print("received lat:%s expected lat:%s" % (str(loc.lat), str(m.lat)))
+            print("received lon:%s expected lon:%s" % (str(loc.lon), str(m.lon)))
+            dist_diff = self.get_distance_int(loc, m)
+            print("Distance:%s" % str(dist_diff))
+            if abs(dist_diff) > 2:
+                continue
+
+            gpi_rel_alt = int(m.relative_alt / 10) # mm -> cm, since driver send alt in cm
+            print("received alt:%s expected alt:%s" % (str(frame.alt()), str(gpi_rel_alt)))
+            if abs(gpi_rel_alt - frame.alt()) > 10:
+                continue
+
+            print("received gndspeed: %s" % str(frame.speed()))
+            if frame.speed() != 0:
+                # FIXME if we start the vehicle moving.... check against VFR_HUD?
+                continue
+
+            print("received temp:%s expected temp:%s" % (str(frame.temp()), str(self.mav.messages['HEARTBEAT'].custom_mode)))
+            if frame.temp() != self.mav.messages['HEARTBEAT'].custom_mode:
+                # currently we receive mode as temp. This should be fixed when driver is updated
+                continue
+
+            # we match the received voltage with the voltage of primary instance
+            batt = self.mav.recv_match(
+                type='BATTERY_STATUS',
+                blocking=True,
+                timeout=5,
+                condition="BATTERY_STATUS.id==0"
+            )
+            if batt is None:
+                raise NotAchievedException("Did not get BATTERY_STATUS message")
+            volt = batt.voltages[0]*0.001
+            print("received voltage:%s expected voltage:%s" % (str(frame.volt()*0.1), str(volt)))
+            if abs(frame.volt()*0.1 - volt) > 0.1:
+                continue
+            # if we reach here, exit
+            break
+        self.context_pop()
+        self.reboot_sitl()
+
+    def test_msp_dji(self):
+        self.set_parameter("SERIAL5_PROTOCOL", 33) # serial5 is MSP DJI output
+        self.set_parameter("MSP_OPTIONS", 1) # telemetry (unpolled) mode
+        self.customise_SITL_commandline([
+            "--uartF=tcp:6735" # serial5 spews to localhost:6735
+        ])
+        msp = MSP_DJI(("127.0.0.1", 6735))
+        self.wait_ready_to_arm()
+        self.drain_mav_unparsed()
+
+        tstart = self.get_sim_time_cached()
+        while True:
+            self.drain_mav()
+            if self.get_sim_time_cached() - tstart > 10:
+                raise NotAchievedException("Did not get location")
+            msp.update()
+            self.drain_mav_unparsed(quiet=True)
+            try:
+                f = msp.get_frame(msp.FRAME_GPS_RAW)
+            except KeyError:
+                continue
+            dist = self.get_distance_int(f.LocationInt(), self.sim_location_int())
+            print("lat=%f lon=%f dist=%f" % (f.lat(), f.lon(), dist))
+            if dist < 1:
+                break
+
     def test_crsf(self):
         self.context_push()
         ex = None
@@ -10891,6 +11269,30 @@ switch value'''
         m = self.assert_receive_message("GPS2_RAW")
         if abs(new_gpi_alt2 - m.alt) > 100:
             raise NotAchievedException("Failover not detected")
+
+    def fetch_file_via_ftp(self, path):
+        '''returns the content of the FTP'able file at path'''
+        mavproxy = self.start_mavproxy()
+        ex = None
+        tmpfile = tempfile.NamedTemporaryFile(mode='r', delete=False)
+        try:
+            mavproxy.send("module load ftp\n")
+            mavproxy.expect(["Loaded module ftp", "module ftp already loaded"])
+            mavproxy.send("ftp get %s %s\n" % (path, tmpfile.name))
+            mavproxy.expect("Getting")
+            self.delay_sim_time(2)
+            mavproxy.send("ftp status\n")
+            mavproxy.expect("No transfer in progress")
+        except Exception as e:
+            self.print_exception_caught(e)
+            ex = e
+
+        self.stop_mavproxy(mavproxy)
+
+        if ex is not None:
+            raise ex
+
+        return tmpfile.read()
 
     def MAVFTP(self):
         '''ensure MAVProxy can do MAVFTP to ardupilot'''
