@@ -6,7 +6,7 @@
 #include <AP_Filesystem/AP_Filesystem_Available.h>
 
 #ifndef HAL_LOGGING_ENABLED
-#define HAL_LOGGING_ENABLED 1
+#define HAL_LOGGING_ENABLED 0
 #endif
 
 // set default for HAL_LOGGING_DATAFLASH_ENABLED
